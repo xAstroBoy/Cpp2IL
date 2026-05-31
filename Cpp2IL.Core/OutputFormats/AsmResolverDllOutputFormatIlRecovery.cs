@@ -90,7 +90,7 @@ public class AsmResolverDllOutputFormatIlRecovery : AsmResolverDllOutputFormat
         }
 
         var ctx = new EmitContext(module, body, methodDefinition, methodContext, i64, this);
-        SeedArgumentTypes(ctx);
+        SeedArguments(ctx);
 
         var indexOf = new Dictionary<InstructionSetIndependentInstruction, int>(isil.Count);
         for (var i = 0; i < isil.Count; i++)
@@ -115,24 +115,39 @@ public class AsmResolverDllOutputFormatIlRecovery : AsmResolverDllOutputFormat
             branch.Operand = labels[target];
     }
 
-    /// <summary>Seeds the argument registers (AArch64 AAPCS64) with their known types: X0 = this for
-    /// instance methods, then integer/object params in X1.. and floating params in V0..</summary>
-    private static void SeedArgumentTypes(EmitContext ctx)
+    /// <summary>Initialises the argument registers (AArch64 AAPCS64) from the method's actual arguments and
+    /// records their types: X0 = this for instance methods, then integer/object params in X1.. and floating
+    /// params in V0.. Without this prologue every register local would start at default(0), so <c>this</c>
+    /// and parameters would decompile as null/0; with it, field/parameter accesses read the real values.</summary>
+    private static void SeedArguments(EmitContext ctx)
     {
-        var m = ctx.MethodContext;
+        var il = ctx.Body.Instructions;
+        var def = ctx.Method;          // AsmResolver method (for ldarg + signature types)
+        var mc = ctx.MethodContext;    // analysis context (for TypeAnalysisContext field resolution)
         var nonVector = 0;
         var vector = 0;
 
-        if (!m.IsStatic && m.DeclaringType != null)
-            ctx.SetRegType("X" + nonVector++, m.DeclaringType);
-
-        foreach (var p in m.Parameters)
+        if (!def.IsStatic)
         {
-            var pt = p.ParameterType;
-            var name = pt?.Namespace == nameof(System) && (pt.Name is "Single" or "Double")
-                ? "V" + vector++
-                : "X" + nonVector++;
-            ctx.SetRegType(name, pt);
+            il.Add(CilOpCodes.Ldarg_0);
+            il.Add(CilOpCodes.Stloc, ctx.GetRegister("X" + nonVector));
+            ctx.SetRegType("X" + nonVector, mc.DeclaringType);
+            nonVector++;
+        }
+
+        var pars = def.Parameters;
+        for (var i = 0; i < pars.Count; i++)
+        {
+            var p = pars[i];
+            var isFloat = p.ParameterType.ElementType is ElementType.R4 or ElementType.R8;
+            var reg = isFloat ? "V" + vector++ : "X" + nonVector++;
+
+            il.Add(CilOpCodes.Ldarg, p);
+            il.Add(CilOpCodes.Stloc, ctx.GetRegister(reg));
+
+            // Track the analysis-model type for field resolution (parallel to the AsmResolver params).
+            if (i < mc.Parameters.Count)
+                ctx.SetRegType(reg, mc.Parameters[i].ParameterType);
         }
     }
 
@@ -157,9 +172,7 @@ public class AsmResolverDllOutputFormatIlRecovery : AsmResolverDllOutputFormat
                 if (ops.Length == 2)
                 {
                     var ts = EmitLoad(ctx, ops[0]);
-                    var t = ctx.GetScratch();
-                    il.Add(CilOpCodes.Stloc, t);
-                    EmitStore(ctx, ops[1], t, ts);
+                    EmitStoreResult(ctx, ops[1], ts);
                 }
                 break;
 
@@ -175,9 +188,7 @@ public class AsmResolverDllOutputFormatIlRecovery : AsmResolverDllOutputFormat
                     {
                         EmitLoad(ctx, ops[0]);
                     }
-                    var t = ctx.GetScratch();
-                    il.Add(CilOpCodes.Stloc, t);
-                    EmitStore(ctx, ops[1], t, null);
+                    EmitStoreResult(ctx, ops[1], null);
                 }
                 break;
 
@@ -200,12 +211,14 @@ public class AsmResolverDllOutputFormatIlRecovery : AsmResolverDllOutputFormat
                 {
                     var ta = ctx.GetScratch();
                     var tb = ctx.GetScratch2();
-                    EmitLoad(ctx, ops[0]);
+                    var taType = EmitLoad(ctx, ops[0]);
                     il.Add(CilOpCodes.Stloc, ta);
-                    EmitLoad(ctx, ops[1]);
+                    var tbType = EmitLoad(ctx, ops[1]);
                     il.Add(CilOpCodes.Stloc, tb);
-                    EmitStore(ctx, ops[0], tb, null);
-                    EmitStore(ctx, ops[1], ta, null);
+                    il.Add(CilOpCodes.Ldloc, tb);
+                    EmitStoreResult(ctx, ops[0], tbType);
+                    il.Add(CilOpCodes.Ldloc, ta);
+                    EmitStoreResult(ctx, ops[1], taType);
                 }
                 break;
 
@@ -261,9 +274,7 @@ public class AsmResolverDllOutputFormatIlRecovery : AsmResolverDllOutputFormat
         EmitLoad(ctx, ops[1]);
         EmitLoad(ctx, ops[2]);
         il.Add(op);
-        var t = ctx.GetScratch();
-        il.Add(CilOpCodes.Stloc, t);
-        EmitStore(ctx, ops[0], t, null); // arithmetic result is numeric - clears any tracked type
+        EmitStoreResult(ctx, ops[0], null); // arithmetic result is numeric - clears any tracked type
     }
 
     private void EmitShift(EmitContext ctx, InstructionSetIndependentOperand[] ops, CilOpCode op)
@@ -275,9 +286,7 @@ public class AsmResolverDllOutputFormatIlRecovery : AsmResolverDllOutputFormat
         EmitLoad(ctx, ops[1]);
         il.Add(CilOpCodes.Conv_I4); // shift amount must be int32/native int
         il.Add(op);
-        var t = ctx.GetScratch();
-        il.Add(CilOpCodes.Stloc, t);
-        EmitStore(ctx, ops[0], t, null);
+        EmitStoreResult(ctx, ops[0], null);
     }
 
     private void EmitUnary(EmitContext ctx, InstructionSetIndependentOperand[] ops, CilOpCode op)
@@ -287,9 +296,7 @@ public class AsmResolverDllOutputFormatIlRecovery : AsmResolverDllOutputFormat
         var il = ctx.Body.Instructions;
         EmitLoad(ctx, ops[0]);
         il.Add(op);
-        var t = ctx.GetScratch();
-        il.Add(CilOpCodes.Stloc, t);
-        EmitStore(ctx, ops[0], t, null);
+        EmitStoreResult(ctx, ops[0], null);
     }
 
     private void EmitConditionalBranch(EmitContext ctx, InstructionSetIndependentInstruction instr, CilOpCode op,
@@ -447,47 +454,53 @@ public class AsmResolverDllOutputFormatIlRecovery : AsmResolverDllOutputFormat
         return null;
     }
 
-    private void EmitStore(EmitContext ctx, InstructionSetIndependentOperand dest, CilLocalVariable valueLocal, TypeAnalysisContext? valueType)
+    /// <summary>Stores the value currently on top of the stack into <paramref name="dest"/>. For register
+    /// and stack destinations this is a direct <c>stloc</c> (no scratch round-trip, so the decompiled
+    /// output reads as <c>dest = expr;</c> rather than <c>tmp = expr; dest = tmp;</c>). Memory destinations
+    /// need the address pushed before the value, so the value is briefly spilled to a scratch local.</summary>
+    private void EmitStoreResult(EmitContext ctx, InstructionSetIndependentOperand dest, TypeAnalysisContext? valueType)
     {
         var il = ctx.Body.Instructions;
         switch (dest.Data)
         {
             case IsilRegisterOperand reg:
-                il.Add(CilOpCodes.Ldloc, valueLocal);
                 il.Add(CilOpCodes.Stloc, ctx.GetRegister(reg.RegisterName));
                 ctx.SetRegType(reg.RegisterName, valueType);
                 break;
             case IsilVectorRegisterElementOperand vec:
-                il.Add(CilOpCodes.Ldloc, valueLocal);
                 il.Add(CilOpCodes.Stloc, ctx.GetRegister(vec.RegisterName));
                 ctx.SetRegType(vec.RegisterName, valueType);
                 break;
             case IsilStackOperand stack:
-                il.Add(CilOpCodes.Ldloc, valueLocal);
                 il.Add(CilOpCodes.Stloc, ctx.GetRegister("stk_" + stack.Offset));
                 ctx.SetRegType("stk_" + stack.Offset, valueType);
                 break;
             case IsilMemoryOperand mem:
+            {
+                var t = ctx.GetScratch();
+                il.Add(CilOpCodes.Stloc, t);
                 if (TryGetStackSlot(ctx, mem, out var slot))
                 {
-                    il.Add(CilOpCodes.Ldloc, valueLocal);
+                    il.Add(CilOpCodes.Ldloc, t);
                     il.Add(CilOpCodes.Stloc, ctx.GetRegister(slot));
                     ctx.SetRegType(slot, valueType);
                 }
                 else if (TryResolveField(ctx, mem, out _, out var imported))
                 {
                     EmitLoad(ctx, mem.Base!.Value);
-                    il.Add(CilOpCodes.Ldloc, valueLocal);
+                    il.Add(CilOpCodes.Ldloc, t);
                     il.Add(CilOpCodes.Stfld, imported);
                 }
                 else
                 {
                     EmitMemoryAddress(ctx, mem);
-                    il.Add(CilOpCodes.Ldloc, valueLocal);
+                    il.Add(CilOpCodes.Ldloc, t);
                     il.Add(CilOpCodes.Stind_I8);
                 }
                 break;
+            }
             default:
+                il.Add(CilOpCodes.Pop);
                 break;
         }
     }
