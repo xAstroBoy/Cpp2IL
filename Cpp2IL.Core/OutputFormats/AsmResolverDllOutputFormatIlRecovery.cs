@@ -9,6 +9,7 @@ using AsmResolver.PE.DotNet.Metadata.Tables;
 using AssetRipper.CIL;
 using Cpp2IL.Core.ISIL;
 using Cpp2IL.Core.Model.Contexts;
+using LibCpp2IL;
 
 namespace Cpp2IL.Core.OutputFormats;
 
@@ -449,6 +450,12 @@ public class AsmResolverDllOutputFormatIlRecovery : AsmResolverDllOutputFormat
             return field.FieldType;
         }
 
+        // Absolute-address load with no base/index: this is almost always an il2cpp metadata-usage global
+        // (string literal, type handle, static field, or method pointer). Resolve it so the raw address
+        // noise becomes a real, readable reference.
+        if (mem.Base == null && mem.Index == null && mem.Addend != 0 && TryEmitMetadataGlobal(ctx, (ulong)mem.Addend))
+            return null;
+
         EmitMemoryAddress(ctx, mem);
         il.Add(CilOpCodes.Ldind_I8);
         return null;
@@ -503,6 +510,30 @@ public class AsmResolverDllOutputFormatIlRecovery : AsmResolverDllOutputFormat
                 il.Add(CilOpCodes.Pop);
                 break;
         }
+    }
+
+    /// <summary>Resolves an absolute-address load to an il2cpp metadata-usage global and emits a real
+    /// reference for it. Currently handles string literals (the highest-value, safest case): the raw
+    /// <c>*(long*)(0 + 0x...)</c> becomes an actual <c>ldstr "..."</c>, which exposes menu paths, names,
+    /// and log messages that reveal what the code is doing. Returns false (fall back to pointer deref)
+    /// for globals we don't yet map.</summary>
+    private bool TryEmitMetadataGlobal(EmitContext ctx, ulong address)
+    {
+        try
+        {
+            var literal = LibCpp2IlMain.GetLiteralByAddress(address);
+            if (literal != null)
+            {
+                ctx.Body.Instructions.Add(CilOpCodes.Ldstr, literal);
+                return true;
+            }
+        }
+        catch
+        {
+            // LibCpp2Il can throw on addresses that aren't in a known table; just fall back.
+        }
+
+        return false;
     }
 
     private static bool TryGetStackSlot(EmitContext ctx, IsilMemoryOperand mem, out string slot)
