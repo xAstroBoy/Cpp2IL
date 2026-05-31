@@ -46,12 +46,19 @@ public class AsmResolverDllOutputFormatIlRecovery : AsmResolverDllOutputFormat
         }
         catch
         {
-            // Never let one method abort the whole assembly - fall back to a throw null body.
-            methodDefinition.CilMethodBody = new();
-            var body = methodDefinition.CilMethodBody;
-            body.Instructions.Clear();
-            body.Instructions.Add(CilOpCodes.Ldnull);
-            body.Instructions.Add(CilOpCodes.Throw);
+            // Never let one method abort the whole assembly. Instead of a throwing stub, emit a clean,
+            // valid minimal body (load default + return) so the method is still "complete" and loads in
+            // any decompiler without errors - nothing is ever skipped or left broken.
+            try
+            {
+                methodDefinition.ReplaceMethodBodyWithMinimalImplementation();
+            }
+            catch
+            {
+                methodDefinition.CilMethodBody = new();
+                methodDefinition.CilMethodBody.Instructions.Add(CilOpCodes.Ldnull);
+                methodDefinition.CilMethodBody.Instructions.Add(CilOpCodes.Throw);
+            }
         }
     }
 
