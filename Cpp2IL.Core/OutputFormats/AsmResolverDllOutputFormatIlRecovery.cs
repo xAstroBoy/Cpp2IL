@@ -170,26 +170,27 @@ public class AsmResolverDllOutputFormatIlRecovery : AsmResolverDllOutputFormat
         switch (instr.OpCode.Mnemonic)
         {
             case IsilMnemonic.Move:
+                // ISIL Move is (dest, src) - operand[0] is the destination, operand[1] is the source.
                 if (ops.Length == 2)
                 {
-                    var ts = EmitLoad(ctx, ops[0]);
-                    EmitStoreResult(ctx, ops[1], ts);
+                    var ts = EmitLoad(ctx, ops[1]);
+                    EmitStoreResult(ctx, ops[0], ts);
                 }
                 break;
 
             case IsilMnemonic.LoadAddress:
+                // LoadAddress is (dest, src) - compute the address of src, store it into dest.
                 if (ops.Length == 2)
                 {
-                    if (ops[0].Data is IsilMemoryOperand mem)
+                    if (ops[1].Data is IsilMemoryOperand mem)
                     {
-                        EmitMemoryAddress(ctx, mem);
-                        il.Add(CilOpCodes.Conv_I8);
+                        EmitAddress(ctx, mem);
                     }
                     else
                     {
-                        EmitLoad(ctx, ops[0]);
+                        EmitLoad(ctx, ops[1]);
                     }
-                    EmitStoreResult(ctx, ops[1], null);
+                    EmitStoreResult(ctx, ops[0], null);
                 }
                 break;
 
@@ -456,8 +457,10 @@ public class AsmResolverDllOutputFormatIlRecovery : AsmResolverDllOutputFormat
         if (mem.Base == null && mem.Index == null && mem.Addend != 0 && TryEmitMetadataGlobal(ctx, (ulong)mem.Addend))
             return null;
 
-        EmitMemoryAddress(ctx, mem);
-        il.Add(CilOpCodes.Ldind_I8);
+        // Unresolved memory read: route through a long-based helper so the output never contains IntPtr /
+        // nint / pointer-dereference syntax. Reads as Mem.ReadInt64(address).
+        EmitAddress(ctx, mem);
+        il.Add(CilOpCodes.Call, ctx.Owner.GetMemHelpers(ctx.Module).Read);
         return null;
     }
 
@@ -500,9 +503,10 @@ public class AsmResolverDllOutputFormatIlRecovery : AsmResolverDllOutputFormat
                 }
                 else
                 {
-                    EmitMemoryAddress(ctx, mem);
+                    // Unresolved memory write -> Mem.WriteInt64(address, value). No IntPtr/pointer syntax.
+                    EmitAddress(ctx, mem);
                     il.Add(CilOpCodes.Ldloc, t);
-                    il.Add(CilOpCodes.Stind_I8);
+                    il.Add(CilOpCodes.Call, ctx.Owner.GetMemHelpers(ctx.Module).Write);
                 }
                 break;
             }
@@ -620,30 +624,24 @@ public class AsmResolverDllOutputFormatIlRecovery : AsmResolverDllOutputFormat
         return map;
     }
 
-    /// <summary>Pushes the effective address of a memory operand (Base + Index*Scale + Addend) as a native int.</summary>
-    private void EmitMemoryAddress(EmitContext ctx, IsilMemoryOperand mem)
+    /// <summary>Pushes the effective address of a memory operand (Base + Index*Scale + Addend) as a plain
+    /// Int64 - deliberately no native-int conversion, so the output never contains IntPtr/nint/pointer
+    /// syntax. The address is consumed by the Mem.ReadInt64/WriteInt64 helpers.</summary>
+    private void EmitAddress(EmitContext ctx, IsilMemoryOperand mem)
     {
         var il = ctx.Body.Instructions;
 
         if (mem.Base != null)
-        {
             EmitLoad(ctx, mem.Base.Value);
-            il.Add(CilOpCodes.Conv_I);
-        }
         else
-        {
-            il.Add(CilOpCodes.Ldc_I4_0);
-            il.Add(CilOpCodes.Conv_I);
-        }
+            il.Add(CilOpCodes.Ldc_I8, 0L);
 
         if (mem.Index != null)
         {
             EmitLoad(ctx, mem.Index.Value);
-            il.Add(CilOpCodes.Conv_I);
             if (mem.Scale > 1)
             {
                 il.Add(CilOpCodes.Ldc_I8, (long)mem.Scale);
-                il.Add(CilOpCodes.Conv_I);
                 il.Add(CilOpCodes.Mul);
             }
             il.Add(CilOpCodes.Add);
@@ -652,8 +650,57 @@ public class AsmResolverDllOutputFormatIlRecovery : AsmResolverDllOutputFormat
         if (mem.Addend != 0)
         {
             il.Add(CilOpCodes.Ldc_I8, mem.Addend);
-            il.Add(CilOpCodes.Conv_I);
             il.Add(CilOpCodes.Add);
+        }
+    }
+
+    // Per-module long-based memory helpers (Mem.ReadInt64 / Mem.WriteInt64) used to represent any memory
+    // access we couldn't resolve to a field, so the recovered C# never shows IntPtr/pointer math.
+    private readonly Dictionary<ModuleDefinition, MemHelpers> _memHelpers = new();
+    private readonly object _memLock = new();
+
+    public readonly struct MemHelpers(IMethodDescriptor read, IMethodDescriptor write)
+    {
+        public readonly IMethodDescriptor Read = read;
+        public readonly IMethodDescriptor Write = write;
+    }
+
+    public MemHelpers GetMemHelpers(ModuleDefinition module)
+    {
+        lock (_memLock)
+        {
+            if (_memHelpers.TryGetValue(module, out var existing))
+                return existing;
+
+            var i64 = module.CorLibTypeFactory.Int64;
+            var voidType = module.CorLibTypeFactory.Void;
+
+            var type = new TypeDefinition("Cpp2IlRecovered", "Mem",
+                TypeAttributes.Public | TypeAttributes.Abstract | TypeAttributes.Sealed | TypeAttributes.Class)
+            {
+                BaseType = module.CorLibTypeFactory.Object.Type
+            };
+            module.TopLevelTypes.Add(type);
+
+            var read = new MethodDefinition("ReadInt64",
+                MethodAttributes.Public | MethodAttributes.Static,
+                new MethodSignature(CallingConventionAttributes.Default, i64, new TypeSignature[] { i64 }));
+            read.CilMethodBody = new();
+            read.CilMethodBody.Instructions.Add(CilOpCodes.Ldc_I4_0);
+            read.CilMethodBody.Instructions.Add(CilOpCodes.Conv_I8);
+            read.CilMethodBody.Instructions.Add(CilOpCodes.Ret);
+            type.Methods.Add(read);
+
+            var write = new MethodDefinition("WriteInt64",
+                MethodAttributes.Public | MethodAttributes.Static,
+                new MethodSignature(CallingConventionAttributes.Default, voidType, new TypeSignature[] { i64, i64 }));
+            write.CilMethodBody = new();
+            write.CilMethodBody.Instructions.Add(CilOpCodes.Ret);
+            type.Methods.Add(write);
+
+            var helpers = new MemHelpers(read, write);
+            _memHelpers[module] = helpers;
+            return helpers;
         }
     }
 
